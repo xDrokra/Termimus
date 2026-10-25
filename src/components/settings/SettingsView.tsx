@@ -21,11 +21,13 @@ import {
   Cpu,
   Layers,
   Cloud,
+  Globe,
   ExternalLink,
   ArrowUpCircle,
 } from "lucide-react";
 import { BackupRestoreSection } from "../vault/BackupRestoreSection";
 import { SyncSection } from "../sync/SyncSection";
+import { WebAccessSection } from "./WebAccessSection";
 import { TerminalThemeTab } from "./TerminalThemeTab";
 import { useVaultStore } from "../../stores/useVaultStore";
 import { useKnownHostsStore } from "../../stores/useKnownHostsStore";
@@ -41,7 +43,7 @@ import { api } from "../../lib/api";
 import { openExternalUrl } from "../../lib/openUrl";
 import kofiIcon from "../../assets/kofi.png";
 
-type SettingsTab = "security" | "terminal" | "sync" | "known_hosts" | "backup" | "about";
+type SettingsTab = "security" | "terminal" | "sync" | "web_access" | "known_hosts" | "backup" | "about";
 
 export function SettingsView() {
   const [activeTab, setActiveTab] = useState<SettingsTab>("security");
@@ -59,6 +61,7 @@ export function SettingsView() {
     { id: "security", label: "Security & Vault", icon: Lock },
     { id: "terminal", label: "Terminal & Theme", icon: Palette },
     { id: "sync", label: "Self-Hosted Sync", icon: Cloud },
+    { id: "web_access", label: "Web Access (LAN)", icon: Globe },
     {
       id: "known_hosts",
       label: "Trusted Host Keys",
@@ -148,6 +151,7 @@ export function SettingsView() {
           {activeTab === "security" && <SecurityVaultTab />}
           {activeTab === "terminal" && <TerminalThemeTab />}
           {activeTab === "sync" && <SyncSection />}
+          {activeTab === "web_access" && <WebAccessSection />}
           {activeTab === "known_hosts" && <KnownHostsTab />}
           {activeTab === "backup" && <BackupRestoreSection />}
           {activeTab === "about" && <AboutTab />}
@@ -760,8 +764,8 @@ function ChangePasswordModal({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     setError(null);
 
-    if (newPassword.length < 6) {
-      setError("New password must be at least 6 characters.");
+    if (newPassword.length < 1) {
+      setError("New password must be at least 1 characters.");
       return;
     }
     if (newPassword !== confirmPassword) {

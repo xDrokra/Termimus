@@ -20,6 +20,8 @@ pub struct AppState {
     pub sftp: Arc<SftpManager>,
     pub tunnel: Arc<TunnelManager>,
     pub pty: Arc<PtyManager>,
+    pub rdp: Arc<crate::rdp::RdpManager>,
+    pub webserver: Arc<crate::webserver::WebServerControl>,
 }
 
 #[derive(Serialize)]
@@ -69,36 +71,44 @@ pub fn vault_setup(state: State<AppState>, password: String) -> Result<(), Strin
     Ok(())
 }
 
-#[tauri::command]
-pub fn vault_unlock(state: State<AppState>, password: String) -> Result<bool, String> {
-    let salt = state
-        .db
+/// Derive the key from the master password and verify it against the stored
+/// verifier, setting it in memory on success. Shared by the Tauri `vault_unlock`
+/// command and the LAN web server's remote-unlock endpoint.
+pub fn vault_unlock_with_password(
+    db: &Database,
+    vault: &VaultManager,
+    password: &str,
+) -> Result<bool, String> {
+    let salt = db
         .get_vault_meta("salt")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Vault has not been initialized yet".to_string())?;
 
-    let verifier_ct = state
-        .db
+    let verifier_ct = db
         .get_vault_meta("verifier_ciphertext")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Corrupted vault state: verifier missing".to_string())?;
 
-    let verifier_nonce = state
-        .db
+    let verifier_nonce = db
         .get_vault_meta("verifier_nonce")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Corrupted vault state: nonce missing".to_string())?;
 
-    let key = VaultManager::derive_key(&password, &salt)?;
-    state.vault.set_key(key);
+    let key = VaultManager::derive_key(password, &salt)?;
+    vault.set_key(key);
 
-    match state.vault.decrypt(&verifier_ct, &verifier_nonce) {
+    match vault.decrypt(&verifier_ct, &verifier_nonce) {
         Ok(decrypted) if decrypted == VaultManager::verification_payload() => Ok(true),
         _ => {
-            state.vault.lock();
+            vault.lock();
             Err("Incorrect master password".to_string())
         }
     }
+}
+
+#[tauri::command]
+pub fn vault_unlock(state: State<AppState>, password: String) -> Result<bool, String> {
+    vault_unlock_with_password(&state.db, &state.vault, &password)
 }
 
 #[tauri::command]
@@ -497,16 +507,25 @@ pub fn folder_delete(state: State<AppState>, id: String) -> Result<(), String> {
     state.db.delete_folder(&id).map_err(|e| e.to_string())
 }
 
-fn resolve_host_auth(state: &AppState, host: &Host) -> Result<SshAuth, String> {
+/// Decrypt and build the `SshAuth` for a host from its stored credential.
+///
+/// Takes the raw managers rather than `&AppState` so it can be reused by the
+/// embedded LAN web server, which holds owned `Arc`s and cannot borrow the
+/// Tauri-managed `AppState`. The vault must be unlocked (enforced by
+/// `VaultManager::decrypt`).
+pub fn resolve_host_auth(
+    db: &Database,
+    vault: &VaultManager,
+    host: &Host,
+) -> Result<SshAuth, String> {
     match host.auth_method.as_str() {
         "password" => {
             let secret = if let Some(cred_id) = &host.credential_id {
-                let cred = state
-                    .db
+                let cred = db
                     .get_credential(cred_id)
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| "Credential record not found".to_string())?;
-                let bytes = state.vault.decrypt(&cred.ciphertext, &cred.nonce)?;
+                let bytes = vault.decrypt(&cred.ciphertext, &cred.nonce)?;
                 String::from_utf8(bytes).map_err(|e| format!("Invalid utf-8 password: {e}"))?
             } else {
                 return Err("No password configured for this host".to_string());
@@ -515,8 +534,7 @@ fn resolve_host_auth(state: &AppState, host: &Host) -> Result<SshAuth, String> {
         }
         "private_key" => {
             let (pem, passphrase) = if let Some(cred_id) = &host.credential_id {
-                let cred = state
-                    .db
+                let cred = db
                     .get_credential(cred_id)
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| "Credential record not found".to_string())?;
@@ -528,7 +546,7 @@ fn resolve_host_auth(state: &AppState, host: &Host) -> Result<SshAuth, String> {
                     ));
                 }
 
-                let pem_bytes = state.vault.decrypt(&cred.ciphertext, &cred.nonce)?;
+                let pem_bytes = vault.decrypt(&cred.ciphertext, &cred.nonce)?;
                 let pem_str = String::from_utf8(pem_bytes).map_err(|e| format!("Invalid utf-8 PEM: {e}"))?;
 
                 if crate::sshkey::is_public_key_text(&pem_str) {
@@ -537,7 +555,7 @@ fn resolve_host_auth(state: &AppState, host: &Host) -> Result<SshAuth, String> {
 
                 let pp = match (&cred.passphrase_ciphertext, &cred.passphrase_nonce) {
                     (Some(ct), Some(n)) => {
-                        let bytes = state.vault.decrypt(ct, n)?;
+                        let bytes = vault.decrypt(ct, n)?;
                         Some(String::from_utf8(bytes).map_err(|e| format!("Invalid passphrase: {e}"))?)
                     }
                     _ => None,
@@ -552,30 +570,29 @@ fn resolve_host_auth(state: &AppState, host: &Host) -> Result<SshAuth, String> {
     }
 }
 
-#[tauri::command]
-pub async fn ssh_connect(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    host_id: String,
-    session_id: String,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
-    let host = state
-        .db
-        .get_host(&host_id)
+/// Resolve everything needed to open an SSH session for a host id: the host row,
+/// its decrypted auth, and (if configured) the jump-host / bastion config.
+///
+/// Shared by the Tauri `ssh_connect` command and the embedded LAN web server so
+/// both go through the exact same credential-resolution and jump-host path.
+pub fn resolve_connection(
+    db: &Database,
+    vault: &VaultManager,
+    host_id: &str,
+) -> Result<(Host, SshAuth, Option<crate::ssh::JumpHostConfig>), String> {
+    let host = db
+        .get_host(host_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Host not found".to_string())?;
 
-    let auth = resolve_host_auth(&state, &host)?;
+    let auth = resolve_host_auth(db, vault, &host)?;
 
     let jump_host = if let Some(ref jid) = host.jump_host_id {
-        let jump = state
-            .db
+        let jump = db
             .get_host(jid)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "Jump Host / Bastion server not found".to_string())?;
-        let jump_auth = resolve_host_auth(&state, &jump)?;
+        let jump_auth = resolve_host_auth(db, vault, &jump)?;
         Some(crate::ssh::JumpHostConfig {
             address: jump.address,
             port: jump.port,
@@ -586,10 +603,26 @@ pub async fn ssh_connect(
         None
     };
 
+    Ok((host, auth, jump_host))
+}
+
+#[tauri::command]
+pub async fn ssh_connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    host_id: String,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let (host, auth, jump_host) = resolve_connection(&state.db, &state.vault, &host_id)?;
+
+    let sink: Arc<dyn crate::ssh::SshEventSink> = Arc::new(crate::ssh::TauriSink(app));
+
     let result = state
         .ssh
         .connect(
-            app,
+            sink,
             state.db.clone(),
             session_id,
             Some(host_id.clone()),
@@ -971,7 +1004,7 @@ pub async fn sftp_connect(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Host not found".to_string())?;
 
-    let auth = resolve_host_auth(&state, &host)?;
+    let auth = resolve_host_auth(&state.db, &state.vault, &host)?;
 
     state
         .sftp
@@ -1245,7 +1278,7 @@ pub async fn tunnel_start(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Target host not found".to_string())?;
 
-    let auth = resolve_host_auth(&state, &host)?;
+    let auth = resolve_host_auth(&state.db, &state.vault, &host)?;
 
     state
         .tunnel
@@ -1869,4 +1902,282 @@ pub async fn sync_get_devices(
 
     let body: DevicesResponse = res.json().await.unwrap_or(DevicesResponse { devices: Vec::new() });
     Ok(body.devices)
+}
+
+// ── RDP (embedded IronRDP client) ──────────────────────────────────────────
+//
+// RDP is offered as an extra action on any host, dialing `address:3389` by
+// default. It needs a username+password (NLA/CredSSP) — an SSH private key is
+// not usable — so when the host has no stored password the frontend supplies
+// credentials via a prompt. Secrets are decrypted only through the vault.
+
+/// Resolve the RDP password: prefer an explicit override from the prompt, else
+/// fall back to the host's stored password credential (vault-decrypted).
+fn resolve_rdp_password(
+    state: &AppState,
+    host: &Host,
+    override_password: Option<String>,
+) -> Result<String, String> {
+    if let Some(pw) = override_password.filter(|p| !p.is_empty()) {
+        return Ok(pw);
+    }
+    match resolve_host_auth(&state.db, &state.vault, host) {
+        Ok(SshAuth::Password(p)) => Ok(p),
+        _ => Err("RDP requires a password. This host has no stored password — enter RDP credentials.".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn rdp_connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    host_id: String,
+    session_id: String,
+    width: u16,
+    height: u16,
+    username: Option<String>,
+    password: Option<String>,
+    domain: Option<String>,
+    port: Option<u16>,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Result<crate::rdp::RdpConnectInfo, String> {
+    let host = state
+        .db
+        .get_host(&host_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Host not found".to_string())?;
+
+    let user = username
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| host.username.clone());
+    let pass = resolve_rdp_password(&state, &host, password)?;
+    let rdp_port = port.unwrap_or(3389);
+
+    let info = state
+        .rdp
+        .connect(
+            app,
+            session_id,
+            host.address.clone(),
+            rdp_port,
+            user,
+            pass,
+            domain,
+            width,
+            height,
+            on_frame,
+        )
+        .await?;
+
+    let _ = state.db.touch_host_last_connected(&host_id);
+    Ok(info)
+}
+
+#[tauri::command]
+pub async fn rdp_input(
+    state: State<'_, AppState>,
+    session_id: String,
+    events: Vec<crate::rdp::RdpInputEvent>,
+) -> Result<(), String> {
+    state.rdp.send_input(&session_id, events).await
+}
+
+#[tauri::command]
+pub async fn rdp_disconnect(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.rdp.disconnect(&session_id).await
+}
+
+/// Fallback for legacy RDP servers (e.g. Windows Server 2003) that only speak
+/// RC4 "Standard RDP Security", which IronRDP deliberately does not implement.
+/// Launch the native Windows client (`mstsc.exe`) pre-filled with host and
+/// username via a throwaway `.rdp` file. The password is intentionally **not**
+/// written anywhere — mstsc prompts for it — so the vault stays the only home
+/// for secrets.
+#[tauri::command]
+pub async fn rdp_launch_external(
+    state: State<'_, AppState>,
+    host_id: String,
+    username: Option<String>,
+    domain: Option<String>,
+    port: Option<u16>,
+) -> Result<(), String> {
+    let host = state
+        .db
+        .get_host(&host_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Host not found".to_string())?;
+
+    let user = username
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| host.username.clone());
+    let rdp_port = port.unwrap_or(3389);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+
+        // CredSSP off + authentication level 0 so mstsc connects to legacy
+        // servers without an NLA attempt or a server-auth warning dialog.
+        let mut content = format!(
+            "full address:s:{}:{}\r\nusername:s:{}\r\nenablecredsspsupport:i:0\r\nauthentication level:i:0\r\n",
+            host.address, rdp_port, user
+        );
+        if let Some(d) = domain.filter(|d| !d.is_empty()) {
+            content.push_str(&format!("domain:s:{d}\r\n"));
+        }
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("termimus-{}.rdp", uuid::Uuid::new_v4()));
+        {
+            let mut f = std::fs::File::create(&path)
+                .map_err(|e| format!("Cannot write .rdp file: {e}"))?;
+            f.write_all(content.as_bytes())
+                .map_err(|e| format!("Cannot write .rdp file: {e}"))?;
+        }
+
+        // The temp .rdp holds only host + username (no secret); the OS reaps the
+        // temp dir. mstsc needs it readable at launch, so we don't delete it.
+        std::process::Command::new("mstsc.exe")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Cannot launch mstsc: {e}"))?;
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (user, rdp_port, domain, &host);
+        Err("External RDP (mstsc) is only available on Windows.".to_string())
+    }
+}
+
+// ── LAN Web Server (embedded HTTP/WebSocket) ────────────────────────────────
+//
+// An opt-in local server that lets a browser on the same network drive SSH
+// terminals against configured hosts. See `webserver/mod.rs`. The master
+// password never leaves this machine — credentials are decrypted server-side
+// (vault must be unlocked) and only PTY bytes cross the wire.
+
+const WEB_DEFAULT_PORT: u16 = 7373;
+
+/// Fetch the persisted pairing token, generating and storing one on first use.
+pub fn web_get_or_create_token(db: &Database) -> Result<String, String> {
+    if let Some(t) = db.get_app_setting("webserver.token").map_err(|e| e.to_string())? {
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    // 24 random bytes -> 48 hex chars.
+    let mut bytes = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    db.set_app_setting("webserver.token", &token)
+        .map_err(|e| e.to_string())?;
+    Ok(token)
+}
+
+fn web_port(db: &Database) -> u16 {
+    db.get_app_setting("webserver.port")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WEB_DEFAULT_PORT)
+}
+
+/// Returns `(port, token)` to auto-start with when the user left the server
+/// enabled; `None` when disabled. Called from `lib.rs` setup.
+pub fn web_server_autostart_config(db: &Database) -> Option<(u16, String)> {
+    let enabled = db
+        .get_app_setting("webserver.enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    if !enabled {
+        return None;
+    }
+    let token = web_get_or_create_token(db).ok()?;
+    Some((web_port(db), token))
+}
+
+#[derive(Serialize)]
+pub struct WebServerStatus {
+    pub running: bool,
+    pub enabled: bool,
+    pub port: u16,
+    pub token: String,
+    /// Candidate base URLs (no token) to show for pairing.
+    pub urls: Vec<String>,
+}
+
+fn web_status(state: &AppState) -> WebServerStatus {
+    let (running, port_opt, token_opt) = state.webserver.status();
+    let enabled = state
+        .db
+        .get_app_setting("webserver.enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    let port = port_opt.unwrap_or_else(|| web_port(&state.db));
+    let token = token_opt
+        .or_else(|| state.db.get_app_setting("webserver.token").ok().flatten())
+        .unwrap_or_default();
+    WebServerStatus {
+        running,
+        enabled,
+        port,
+        token,
+        urls: crate::webserver::lan_urls(port),
+    }
+}
+
+#[tauri::command]
+pub async fn web_server_start(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+) -> Result<WebServerStatus, String> {
+    let token = web_get_or_create_token(&state.db)?;
+    let port = port.unwrap_or_else(|| web_port(&state.db));
+
+    let bound = state
+        .webserver
+        .start(
+            state.db.clone(),
+            state.vault.clone(),
+            state.ssh.clone(),
+            port,
+            token,
+        )
+        .await?;
+
+    state
+        .db
+        .set_app_setting("webserver.enabled", "true")
+        .map_err(|e| e.to_string())?;
+    state
+        .db
+        .set_app_setting("webserver.port", &bound.to_string())
+        .map_err(|e| e.to_string())?;
+
+    Ok(web_status(&state))
+}
+
+#[tauri::command]
+pub fn web_server_stop(state: State<AppState>) -> Result<WebServerStatus, String> {
+    state.webserver.stop();
+    state
+        .db
+        .set_app_setting("webserver.enabled", "false")
+        .map_err(|e| e.to_string())?;
+    Ok(web_status(&state))
+}
+
+#[tauri::command]
+pub fn web_server_status(state: State<AppState>) -> Result<WebServerStatus, String> {
+    Ok(web_status(&state))
 }

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 
 export interface Host {
   id: string;
@@ -31,6 +31,20 @@ export interface HostInput {
   os_icon?: string | null;
   jump_host_id?: string | null;
 }
+
+export interface RdpConnectInfo {
+  width: number;
+  height: number;
+}
+
+/** Input event sent to the RDP backend. Discriminator matches the Rust
+ *  serde enum (`#[serde(tag = "kind", rename_all = "camelCase")]`). */
+export type RdpInputEvent =
+  | { kind: "mouseMove"; x: number; y: number }
+  | { kind: "mouseButton"; button: number; down: boolean; x: number; y: number }
+  | { kind: "wheel"; vertical: boolean; units: number }
+  | { kind: "key"; scancode: number; down: boolean }
+  | { kind: "unicode"; ch: string; down: boolean };
 
 export interface KeychainItem {
   id: string;
@@ -199,6 +213,15 @@ export interface ImportSummary {
   safety_snapshot_path: string | null;
 }
 
+export interface WebServerStatus {
+  running: boolean;
+  enabled: boolean;
+  port: number;
+  token: string;
+  /** Candidate base URLs (without the token) for pairing. */
+  urls: string[];
+}
+
 export const api = {
   // Vault
   getVaultStatus: () => invoke<VaultStatus>("vault_status"),
@@ -242,6 +265,33 @@ export const api = {
     invoke<void>("ssh_resize", { sessionId, cols, rows }),
   disconnectSsh: (sessionId: string) =>
     invoke<void>("ssh_disconnect", { sessionId }),
+
+  // RDP Sessions (embedded IronRDP client). The backend streams dirty-rectangle
+  // framebuffer updates over `onFrame` as raw ArrayBuffers.
+  rdpConnect: (
+    args: {
+      hostId: string;
+      sessionId: string;
+      width: number;
+      height: number;
+      username?: string;
+      password?: string;
+      domain?: string;
+      port?: number;
+    },
+    onFrame: Channel<ArrayBuffer>,
+  ) => invoke<RdpConnectInfo>("rdp_connect", { ...args, onFrame }),
+  rdpInput: (sessionId: string, events: RdpInputEvent[]) =>
+    invoke<void>("rdp_input", { sessionId, events }),
+  rdpDisconnect: (sessionId: string) =>
+    invoke<void>("rdp_disconnect", { sessionId }),
+  /** Fallback for legacy (RC4-only) servers: open the native Windows client. */
+  rdpLaunchExternal: (args: {
+    hostId: string;
+    username?: string;
+    domain?: string;
+    port?: number;
+  }) => invoke<void>("rdp_launch_external", args),
 
   // Local PTY Sessions
   getDefaultLocalShell: () => invoke<string>("local_pty_default_shell"),
@@ -399,4 +449,10 @@ export const api = {
     invoke<void>("sync_secrets_save", { authToken, syncPassword }),
   syncSecretsLoad: () =>
     invoke<{ authToken: string; syncPassword: string } | null>("sync_secrets_load"),
+
+  // LAN Web Server (browser terminal access over the local network)
+  webServerStatus: () => invoke<WebServerStatus>("web_server_status"),
+  webServerStart: (port?: number) =>
+    invoke<WebServerStatus>("web_server_start", { port: port ?? null }),
+  webServerStop: () => invoke<WebServerStatus>("web_server_stop"),
 };

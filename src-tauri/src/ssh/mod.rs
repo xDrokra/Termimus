@@ -44,6 +44,50 @@ pub struct SshProgressPayload {
     pub is_error: bool,
 }
 
+/// Transport-agnostic sink for everything an SSH session pushes back to a
+/// client: raw PTY bytes, close notifications, connection-progress updates and
+/// live OS-detection results. The desktop app uses `TauriSink` (forwards to the
+/// webview via `AppHandle::emit`); the embedded LAN web server supplies its own
+/// WebSocket-backed sink. Keeping this trait between the session worker and the
+/// transport is what lets `SessionManager` stay free of Tauri types and be
+/// reused by a plain HTTP/WebSocket server sharing the same `AppState`.
+pub trait SshEventSink: Send + Sync {
+    /// Raw PTY output bytes for a session.
+    fn data(&self, session_id: &str, bytes: Vec<u8>);
+    /// Session closed (EOF / Close / channel gone).
+    fn closed(&self, session_id: &str);
+    /// A connection-handshake progress update.
+    fn progress(&self, session_id: &str, payload: SshProgressPayload);
+    /// Background OS detection resolved a distro slug for a host.
+    fn os_detected(&self, host_id: &str, os_icon: &str);
+}
+
+/// `SshEventSink` adapter that forwards every event to the Tauri webview using
+/// the exact event names the frontend already listens for (`ssh-data-*`,
+/// `ssh-closed-*`, `ssh-progress-*`, `host-os-detected`) — so desktop behaviour
+/// is byte-for-byte identical to the previous direct `app.emit` calls.
+pub struct TauriSink(pub AppHandle);
+
+impl SshEventSink for TauriSink {
+    fn data(&self, session_id: &str, bytes: Vec<u8>) {
+        let _ = self.0.emit(&format!("ssh-data-{session_id}"), bytes);
+    }
+    fn closed(&self, session_id: &str) {
+        let _ = self
+            .0
+            .emit(&format!("ssh-closed-{session_id}"), session_id.to_string());
+    }
+    fn progress(&self, session_id: &str, payload: SshProgressPayload) {
+        let _ = self.0.emit(&format!("ssh-progress-{session_id}"), payload);
+    }
+    fn os_detected(&self, host_id: &str, os_icon: &str) {
+        let _ = self.0.emit(
+            "host-os-detected",
+            serde_json::json!({ "host_id": host_id, "os_icon": os_icon }),
+        );
+    }
+}
+
 /// Verifies the server's host key against the locally stored known_hosts
 /// table (Trust On First Use), rejecting the connection outright if the
 /// key ever changes for a previously trusted address:port — this is the
@@ -249,7 +293,7 @@ impl SessionManager {
 
     pub async fn connect(
         &self,
-        app: AppHandle,
+        sink: Arc<dyn SshEventSink>,
         db: Arc<Database>,
         session_id: String,
         host_id: Option<String>,
@@ -289,7 +333,7 @@ impl SessionManager {
         }
 
         let res = self
-            .do_connect(app, db, session_id.clone(), host_id, address, port, username, auth, cols, rows, jump_host)
+            .do_connect(sink, db, session_id.clone(), host_id, address, port, username, auth, cols, rows, jump_host)
             .await;
 
         {
@@ -326,7 +370,7 @@ impl SessionManager {
 
     async fn do_connect(
         &self,
-        app: AppHandle,
+        sink: Arc<dyn SshEventSink>,
         db: Arc<Database>,
         session_id: String,
         host_id: Option<String>,
@@ -340,10 +384,9 @@ impl SessionManager {
     ) -> Result<(), String> {
         self.check_cancelled(&session_id).await?;
 
-        let progress_event = format!("ssh-progress-{session_id}");
         let emit_progress = |step: u8, step_name: &str, message: &str, is_error: bool| {
-            let _ = app.emit(
-                &progress_event,
+            sink.progress(
+                &session_id,
                 SshProgressPayload {
                     step,
                     step_name: step_name.to_string(),
@@ -575,9 +618,7 @@ impl SessionManager {
             sessions.insert(session_id.clone(), session.clone());
         }
 
-        let event_name = format!("ssh-data-{session_id}");
-        let closed_event = format!("ssh-closed-{session_id}");
-        let app_for_output = app.clone();
+        let sink_for_output = sink.clone();
         let sid_for_output = session_id.clone();
 
         // Worker task: stream server output to frontend & handle incoming commands (write & resize)
@@ -608,13 +649,13 @@ impl SessionManager {
                                 match flush_deadline {
                                     None => {
                                         // Idle stream: emit interactive echo immediately (0ms delay)
-                                        let _ = app_for_output.emit(&event_name, data.to_vec());
+                                        sink_for_output.data(&sid_for_output, data.to_vec());
                                         flush_deadline = Some(tokio::time::Instant::now() + flush_delay);
                                     }
                                     Some(_) => {
                                         pending.extend_from_slice(data);
                                         if pending.len() >= 64 * 1024 {
-                                            let _ = app_for_output.emit(&event_name, std::mem::take(&mut pending));
+                                            sink_for_output.data(&sid_for_output, std::mem::take(&mut pending));
                                             flush_deadline = None;
                                         }
                                     }
@@ -623,13 +664,13 @@ impl SessionManager {
                             Some(russh::ChannelMsg::ExtendedData { ref data, .. }) => {
                                 match flush_deadline {
                                     None => {
-                                        let _ = app_for_output.emit(&event_name, data.to_vec());
+                                        sink_for_output.data(&sid_for_output, data.to_vec());
                                         flush_deadline = Some(tokio::time::Instant::now() + flush_delay);
                                     }
                                     Some(_) => {
                                         pending.extend_from_slice(data);
                                         if pending.len() >= 64 * 1024 {
-                                            let _ = app_for_output.emit(&event_name, std::mem::take(&mut pending));
+                                            sink_for_output.data(&sid_for_output, std::mem::take(&mut pending));
                                             flush_deadline = None;
                                         }
                                     }
@@ -637,9 +678,9 @@ impl SessionManager {
                             }
                             Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => {
                                 if !pending.is_empty() {
-                                    let _ = app_for_output.emit(&event_name, std::mem::take(&mut pending));
+                                    sink_for_output.data(&sid_for_output, std::mem::take(&mut pending));
                                 }
-                                let _ = app_for_output.emit(&closed_event, sid_for_output.clone());
+                                sink_for_output.closed(&sid_for_output);
                                 break;
                             }
                             _ => {}
@@ -647,7 +688,7 @@ impl SessionManager {
                     }
                     _ = sleep => {
                         if !pending.is_empty() {
-                            let _ = app_for_output.emit(&event_name, std::mem::take(&mut pending));
+                            sink_for_output.data(&sid_for_output, std::mem::take(&mut pending));
                         }
                         flush_deadline = None;
                     }
@@ -676,7 +717,7 @@ impl SessionManager {
         // affects the primary PTY channel or the session itself.
         if let Some(hid) = host_id {
             if !has_jump {
-                let app_for_os = app.clone();
+                let sink_for_os = sink.clone();
                 let db_for_os = db.clone();
                 let addr_for_os = address.clone();
                 let port_for_os = port;
@@ -688,7 +729,7 @@ impl SessionManager {
                     // slower servers).
                     tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
                     detect_os_via_exec(
-                        &app_for_os,
+                        sink_for_os,
                         db_for_os,
                         addr_for_os,
                         port_for_os,
@@ -849,7 +890,7 @@ pub fn parse_os_release(output: &str) -> Option<String> {
 /// `cat /etc/os-release`.  Returns the detected distro slug, or `None`
 /// on any failure — this never propagates errors to the caller.
 pub async fn detect_os_via_exec(
-    app: &AppHandle,
+    sink: Arc<dyn SshEventSink>,
     db: Arc<Database>,
     address: String,
     port: u16,
@@ -918,10 +959,7 @@ pub async fn detect_os_via_exec(
 
     if let Ok(Some(slug)) = result {
         if let Ok(()) = db.update_host_os_icon(&host_id, &slug) {
-            let _ = app.emit(
-                "host-os-detected",
-                serde_json::json!({ "host_id": host_id, "os_icon": slug }),
-            );
+            sink.os_detected(&host_id, &slug);
         }
     }
 }

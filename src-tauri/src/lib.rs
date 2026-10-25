@@ -2,15 +2,18 @@ pub mod biometric;
 pub mod commands;
 pub mod db;
 pub mod pty;
+pub mod rdp;
 pub mod sftp;
 pub mod ssh;
 pub mod sshkey;
 pub mod tunnel;
 pub mod vault;
+pub mod webserver;
 
 use commands::AppState;
 use db::Database;
 use pty::PtyManager;
+use rdp::RdpManager;
 use sftp::SftpManager;
 use ssh::SessionManager;
 use std::sync::Arc;
@@ -20,14 +23,23 @@ use vault::VaultManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // rustls 0.23 panics at the first TLS handshake if it can't unambiguously
+    // pick a crypto provider — and our tree has both aws-lc-rs (reqwest /
+    // ironrdp-tls) and ring (russh). Install a process-wide default up front so
+    // RDP's CredSSP/NLA upgrade (which runs on a tokio worker thread) doesn't
+    // blow up. `install_default` errors only if one is already set, so ignore it.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let db = Arc::new(Database::new().expect("Failed to initialize SQLite database"));
     let vault = Arc::new(VaultManager::new());
     let ssh = Arc::new(SessionManager::new());
     let sftp = Arc::new(SftpManager::new());
     let tunnel = Arc::new(TunnelManager::new());
     let pty = Arc::new(PtyManager::new());
+    let rdp = Arc::new(RdpManager::new());
+    let webserver = Arc::new(webserver::WebServerControl::new());
 
-    let state = AppState { db, vault, ssh, sftp, tunnel, pty };
+    let state = AppState { db, vault, ssh, sftp, tunnel, pty, rdp, webserver };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -57,6 +69,10 @@ pub fn run() {
             commands::ssh_write,
             commands::ssh_resize,
             commands::ssh_disconnect,
+            commands::rdp_connect,
+            commands::rdp_input,
+            commands::rdp_disconnect,
+            commands::rdp_launch_external,
             commands::local_pty_default_shell,
             commands::local_pty_spawn,
             commands::local_pty_write,
@@ -114,7 +130,26 @@ pub fn run() {
             commands::sync_get_devices,
             commands::sync_secrets_save,
             commands::sync_secrets_load,
+            commands::web_server_start,
+            commands::web_server_stop,
+            commands::web_server_status,
         ])
+        .setup(|app| {
+            // Re-start the LAN web server at launch if the user left it enabled.
+            // Connections still fail cleanly until the vault is unlocked, so
+            // auto-starting here is safe.
+            let state = app.state::<AppState>();
+            if let Some((port, token)) = commands::web_server_autostart_config(&state.db) {
+                let control = state.webserver.clone();
+                let db = state.db.clone();
+                let vault = state.vault.clone();
+                let ssh = state.ssh.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = control.start(db, vault, ssh, port, token).await;
+                });
+            }
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building termimus application")
         .run(|app_handle, event| {
@@ -122,11 +157,17 @@ pub fn run() {
             // every live session before the process exits. Bounded by a timeout
             // so quitting never hangs on dead sockets.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                let ssh = app_handle.state::<AppState>().ssh.clone();
+                let state = app_handle.state::<AppState>();
+                state.webserver.stop();
+                let ssh = state.ssh.clone();
+                let rdp = state.rdp.clone();
                 tauri::async_runtime::block_on(async move {
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(2),
-                        ssh.disconnect_all(),
+                        async {
+                            ssh.disconnect_all().await;
+                            rdp.disconnect_all().await;
+                        },
                     )
                     .await;
                 });

@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Termimus Web</title>
+    <meta name="theme-color" content="#0b0f14" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Termimus" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <link rel="apple-touch-icon" sizes="256x256" href="icon-256.png" />
+    <link rel="stylesheet" href="vendor/xterm.css" />
+    <style>
+      :root {
+        --canvas: #0b0f14;
+        --surface: #141b24;
+        --surface-2: #1b2430;
+        --border: #263241;
+        --text: #e6edf3;
+        --text-dim: #8b98a5;
+        --primary: #3b82f6;
+        --danger: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--canvas);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+        -webkit-text-size-adjust: 100%;
+      }
+      #app { display: flex; flex-direction: column; height: 100dvh; }
+
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 12px;
+        padding-top: max(10px, env(safe-area-inset-top));
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        flex: 0 0 auto;
+      }
+      header h1 {
+        font-size: 14px;
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      header #logo { width: 20px; height: 20px; border-radius: 5px; flex: 0 0 auto; }
+      header .spacer { flex: 1; }
+
+      button {
+        font: inherit;
+        color: var(--text);
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+      button:active { opacity: 0.7; }
+      button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+
+      .icon-btn {
+        padding: 6px 10px;
+        min-width: 38px;
+        font-size: 13px;
+        line-height: 1;
+        border-radius: 8px;
+      }
+      #termControls { display: flex; gap: 6px; }
+
+      .screen { flex: 1 1 auto; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; }
+      .hidden { display: none !important; }
+
+      /* Token gate */
+      .pad { padding: 20px 16px; max-width: 520px; margin: 0 auto; }
+      .pad p { color: var(--text-dim); line-height: 1.5; }
+      input[type="text"], input[type="password"], input[type="search"] {
+        width: 100%;
+        font: inherit;
+        color: var(--text);
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 11px 12px;
+        margin: 0;
+      }
+      .pad input { margin: 10px 0; }
+
+      /* Search bar (sticky) */
+      .search-bar {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        padding: 10px 12px;
+        background: var(--canvas);
+        border-bottom: 1px solid var(--border);
+      }
+
+      /* Host list — small cards, generous spacing */
+      ul.hosts { list-style: none; margin: 0; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+      ul.hosts li {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 9px 12px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--surface);
+        cursor: pointer;
+      }
+      ul.hosts li:active { background: var(--surface-2); }
+      .host-icon {
+        flex: 0 0 auto;
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .host-icon svg { width: 17px; height: 17px; fill: #fff; }
+      .host-body { min-width: 0; flex: 1; }
+      .host-label {
+        font-weight: 600;
+        font-size: 13.5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .host-sub {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--text-dim);
+        font-size: 11.5px;
+        margin-top: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .note { color: var(--text-dim); font-size: 13px; padding: 10px 16px; }
+      .error { color: var(--danger); }
+
+      /* Vault-locked banner */
+      .vault-banner {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 10px 12px 0;
+        padding: 10px 12px;
+        border: 1px solid rgba(245, 158, 11, 0.35);
+        background: rgba(245, 158, 11, 0.12);
+        border-radius: 10px;
+        font-size: 12.5px;
+        color: #fcd9a1;
+      }
+      .vault-banner .spacer { flex: 1; }
+      .vault-banner button {
+        padding: 6px 12px;
+        font-size: 12px;
+        background: #f59e0b;
+        border-color: #f59e0b;
+        color: #1a1205;
+        font-weight: 600;
+      }
+
+      /* Modal */
+      .modal {
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        background: rgba(0, 0, 0, 0.6);
+      }
+      .modal-card {
+        width: 100%;
+        max-width: 380px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 18px;
+      }
+      .modal-card h3 { margin: 0 0 8px; font-size: 15px; }
+      .modal-card p { margin: 0 0 12px; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+      .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+
+      /* Terminal */
+      #termScreen { background: #000; padding: 4px; overflow: hidden; }
+      #terminal { width: 100%; height: 100%; }
+      /* Make the xterm scrollback scrollable with touch momentum on mobile. */
+      .xterm .xterm-viewport {
+        overflow-y: auto !important;
+        -webkit-overflow-scrolling: touch;
+        touch-action: pan-y;
+      }
+      .status {
+        padding: 5px 14px;
+        font-size: 12px;
+        color: var(--text-dim);
+        background: var(--surface);
+        border-top: 1px solid var(--border);
+        flex: 0 0 auto;
+        padding-bottom: max(5px, env(safe-area-inset-bottom));
+      }
+      .status.err { color: var(--danger); }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <button id="backBtn" class="icon-btn hidden">‹</button>
+        <img id="logo" src="favicon.png" alt="" />
+        <h1 id="title">Termimus</h1>
+        <span class="spacer"></span>
+        <div id="termControls" class="hidden">
+          <button class="icon-btn" id="fontDown" title="Smaller text">A−</button>
+          <button class="icon-btn" id="fontUp" title="Larger text">A+</button>
+          <button class="icon-btn" id="pageUp" title="Scroll up">▲</button>
+          <button class="icon-btn" id="pageDown" title="Scroll down">▼</button>
+        </div>
+      </header>
+
+      <!-- Token gate -->
+      <section id="tokenScreen" class="screen pad hidden">
+        <h2>Pairing required</h2>
+        <p>
+          Enter the access token shown in the Termimus desktop app under
+          <strong>Settings → Web Access (LAN)</strong>. Tip: open the full link from
+          the desktop (it already contains the token).
+        </p>
+        <input id="tokenInput" type="password" placeholder="Access token" autocomplete="off" />
+        <button class="primary" id="tokenBtn">Continue</button>
+        <p id="tokenErr" class="error"></p>
+      </section>
+
+      <!-- Host list -->
+      <section id="listScreen" class="screen hidden">
+        <div class="search-bar">
+          <input id="searchInput" type="search" inputmode="search" placeholder="Search hosts…" autocomplete="off" />
+        </div>
+        <div id="vaultBanner" class="vault-banner hidden">
+          <span>🔒 Vault locked — connections will fail until unlocked.</span>
+          <span class="spacer"></span>
+          <button id="vaultUnlockBtn">Unlock</button>
+        </div>
+        <div class="note" id="listNote">Loading hosts…</div>
+        <ul class="hosts" id="hostList"></ul>
+      </section>
+
+      <!-- Terminal -->
+      <section id="termScreen" class="screen hidden">
+        <div id="terminal"></div>
+      </section>
+      <div id="termStatus" class="status hidden"></div>
+    </div>
+
+    <!-- Vault unlock modal -->
+    <div id="unlockModal" class="modal hidden">
+      <div class="modal-card">
+        <h3>Unlock vault</h3>
+        <p>
+          Enter your master password so the desktop can decrypt credentials for this
+          session. It is sent to your computer over the local network.
+        </p>
+        <input id="unlockInput" type="password" placeholder="Master password" autocomplete="off" />
+        <p id="unlockErr" class="error" style="margin-top:10px"></p>
+        <div class="modal-actions">
+          <button id="unlockCancel">Cancel</button>
+          <button class="primary" id="unlockConfirm">Unlock</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/addon-fit.js"></script>
+    <script src="distro-icons.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
