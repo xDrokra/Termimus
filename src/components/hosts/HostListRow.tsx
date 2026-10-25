@@ -7,9 +7,13 @@ import {
   Trash2,
   CopyPlus,
   MoreVertical,
+  Monitor,
 } from "lucide-react";
 import { Host } from "../../lib/api";
 import { DistroBadge } from "./DistroBadge";
+
+const IS_WINDOWS =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
 export interface HostListRowProps {
   host: Host;
@@ -20,6 +24,7 @@ export interface HostListRowProps {
   onConnect: (host: Host) => void;
   onToggleMenu: (hostId: string) => void;
   onSftp: (e: React.MouseEvent, host: Host) => void;
+  onRdp?: (host: Host) => void;
   onTunnels: () => void;
   onEdit: (host: Host) => void;
   onDuplicate: (host: Host) => void;
@@ -36,6 +41,7 @@ export const HostListRow = memo(function HostListRow({
   onConnect,
   onToggleMenu,
   onSftp,
+  onRdp,
   onTunnels,
   onEdit,
   onDuplicate,
@@ -177,6 +183,19 @@ export const HostListRow = memo(function HostListRow({
                 <FolderOpen size={13} />
                 <span>SFTP Files</span>
               </button>
+
+              {IS_WINDOWS && onRdp && (
+                <button
+                  onClick={() => {
+                    onToggleMenu(host.id);
+                    onRdp(host);
+                  }}
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--surface-high)] transition"
+                >
+                  <Monitor size={13} />
+                  <span>Connetti RDP</span>
+                </button>
+              )}
 
               <button
                 onClick={() => {

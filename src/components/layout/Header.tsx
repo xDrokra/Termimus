@@ -18,6 +18,7 @@ import {
   XCircle,
   CopyPlus,
   Laptop,
+  Monitor,
   Lock,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -450,6 +451,8 @@ export function Header({
                 {/* Connection Status Dot / Local Terminal Icon */}
                 {isConnecting ? (
                   <Loader2 size={11} className="animate-spin text-[var(--primary)] shrink-0" />
+                ) : primaryTab.kind === "rdp" ? (
+                  <Monitor size={12} className="text-sky-400 shrink-0" />
                 ) : primaryTab.isLocal ? (
                   <Laptop size={12} className="text-emerald-400 shrink-0" />
                 ) : (

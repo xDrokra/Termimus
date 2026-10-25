@@ -14,6 +14,7 @@ import { useHostStore } from "../../stores/useHostStore";
 import { useTerminalThemeStore } from "../../stores/useTerminalThemeStore";
 import { getTerminalTheme } from "../../lib/terminalThemes";
 import { XtermView } from "./XtermView";
+import { RdpView } from "../rdp/RdpView";
 import { DropZoneOverlay } from "./DropZoneOverlay";
 
 interface PaneViewProps {
@@ -374,6 +375,18 @@ export function PaneView({ pane, visible = true }: PaneViewProps) {
           const tab = tabs.find((t) => t.id === tabId);
           if (!tab) return null;
           const isTabActive = tab.id === pane.activeTabId;
+
+          if (tab.kind === "rdp") {
+            return (
+              <RdpView
+                key={tab.id}
+                sessionId={tab.id}
+                hostId={tab.hostId}
+                visible={visible && isTabActive}
+                isFocused={isFocused && isTabActive}
+              />
+            );
+          }
 
           return (
             <XtermView

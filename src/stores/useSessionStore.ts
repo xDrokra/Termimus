@@ -18,6 +18,8 @@ import {
   updateSplitRatio,
 } from "../lib/layoutTree";
 import { disposeTerminalSession } from "../components/terminal/XtermView";
+import { disposeRdpSession } from "../components/rdp/RdpView";
+import { setPendingRdpCreds, RdpCredentials } from "../lib/rdpCreds";
 
 const textEncoder = new TextEncoder();
 
@@ -30,6 +32,8 @@ export interface SshTab {
   connecting: boolean;
   error?: string;
   isLocal?: boolean;
+  /** Session subtype. Defaults to "ssh"; "rdp" renders RdpView instead of XtermView. */
+  kind?: "ssh" | "local" | "rdp";
 }
 
 export type DropZone = "left" | "right" | "top" | "bottom" | "center";
@@ -74,6 +78,7 @@ interface SessionState {
 
   // Session lifecycle
   openSession: (host: Host, newGroup?: boolean) => Promise<string>;
+  openRdpSession: (host: Host, creds?: RdpCredentials) => Promise<string>;
   openLocalSession: (newGroup?: boolean) => Promise<string>;
   openLocalSessionInSplit: (
     targetPaneId: string,
@@ -212,6 +217,44 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         activeGroupId: currentGroup.id,
         rootPane: updatedRoot,
         activePaneId: targetPaneId,
+      };
+    });
+
+    return sessionId;
+  },
+
+  // RDP always opens in its own top-bar group (a graphical desktop isn't useful
+  // squeezed into a terminal split), rendered by RdpView via the "rdp" kind.
+  openRdpSession: async (host: Host, creds?: RdpCredentials) => {
+    const sessionId = `rdp-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    if (creds) {
+      setPendingRdpCreds(sessionId, creds);
+    }
+    const newTab: SshTab = {
+      id: sessionId,
+      hostId: host.id,
+      hostLabel: host.label,
+      hostAddress: `${host.username}@${host.address}`,
+      connected: false,
+      connecting: true,
+      kind: "rdp",
+    };
+
+    set((state) => {
+      const initial = createInitialLayout(sessionId);
+      const newGroupObj: TerminalGroup = {
+        id: generateGroupId(),
+        rootPane: initial,
+        label: `RDP: ${host.label}`,
+      };
+      return {
+        tabs: [...state.tabs, newTab],
+        activeTabId: sessionId,
+        groups: [...state.groups, newGroupObj],
+        activeGroupId: newGroupObj.id,
+        rootPane: initial,
+        activePaneId: initial.id,
+        maximizedPaneId: null,
       };
     });
 
@@ -532,7 +575,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // 2. Disconnect SSH / Local backend
     const tabToClose = get().tabs.find((t) => t.id === sessionId);
     try {
-      if (tabToClose?.isLocal) {
+      if (tabToClose?.kind === "rdp") {
+        disposeRdpSession(sessionId);
+        await api.rdpDisconnect(sessionId);
+      } else if (tabToClose?.isLocal) {
         await api.killLocalPty(sessionId);
       } else {
         await api.disconnectSsh(sessionId);

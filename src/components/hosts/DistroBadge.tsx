@@ -25,6 +25,17 @@ import {
 } from "simple-icons";
 import { Host } from "../../lib/api";
 
+// Windows is not a Linux distro and Simple Icons no longer ships its logo
+// (removed for trademark reasons), so we provide a self-contained icon that
+// matches the SimpleIcon shape consumed by DISTRO_MAP / DistroBadge.
+const siWindows: SimpleIcon = {
+  title: "Windows",
+  slug: "windows",
+  hex: "0078D4",
+  // Windows 11 logo: a 2×2 grid of four equal squares.
+  path: "M0 0h11v11H0z M13 0h11v11H13z M0 13h11v11H0z M13 13h11v11H13z",
+} as SimpleIcon;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Distro Types & Metadata powered by official Simple Icons
 // ══════════════════════════════════════════════════════════════════════════════
@@ -53,7 +64,8 @@ export type DistroType =
   | "raspbian"
   | "amazon"
   | "linux"
-  | "generic";
+  | "generic"
+  | "windows";
 
 interface DistroMeta {
   type: DistroType;
@@ -80,6 +92,12 @@ const DISTRO_MAP: Record<DistroType, DistroMeta> = {
     label: siAlpinelinux.title,
     icon: siAlpinelinux,
     bgColor: `#${siAlpinelinux.hex}`,
+  },
+  windows: {
+    type: "windows",
+    label: siWindows.title,
+    icon: siWindows,
+    bgColor: `#${siWindows.hex}`,
   },
   arch: {
     type: "arch",
@@ -232,6 +250,7 @@ export const DISTRO_OPTIONS: { id: string; label: string }[] = [
   { id: "void", label: siVoidlinux.title },
   { id: "slackware", label: siSlackware.title },
   { id: "raspbian", label: siRaspberrypi.title },
+  { id: "windows", label: siWindows.title },
   { id: "amazon", label: "Amazon Linux" },
   { id: "generic", label: "Generic Linux" },
 ];
@@ -271,6 +290,7 @@ function heuristicDistro(host: Host): DistroType {
   if (combined.includes("slackware")) return "slackware";
   if (combined.includes("pi") || combined.includes("raspberry") || combined.includes("raspbian")) return "raspbian";
   if (combined.includes("amazon") || combined.includes("amzn")) return "amazon";
+  if (combined.includes("windows") || combined.includes("win-") || combined.includes("winsrv")) return "windows";
   return "generic";
 }
 

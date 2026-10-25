@@ -19,6 +19,7 @@ import {
   Rows2,
   RefreshCw,
   Check,
+  Monitor,
 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { useHostStore } from "../../stores/useHostStore";
@@ -28,12 +29,19 @@ import { usePingStore } from "../../stores/usePingStore";
 import { useConfirmStore } from "../../stores/useConfirmStore";
 import { useVaultStore } from "../../stores/useVaultStore";
 import { FolderModal } from "./FolderModal";
+import { RdpCredentialsModal } from "../rdp/RdpCredentialsModal";
+import { RdpCredentials } from "../../lib/rdpCreds";
 import { Host, Folder } from "../../lib/api";
 import { DistroBadge } from "./DistroBadge";
 import { HostListRow } from "./HostListRow";
 
 // Ping interval: 60s is gentle on router & network, battery-friendly on laptops
 const PING_INTERVAL_MS = 60000;
+
+// RDP ships Windows-only in v1 (uses the embedded IronRDP client); the action is
+// hidden elsewhere. WebView2's UA reliably reports "Windows".
+const IS_WINDOWS =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
 interface HostListProps {
   onOpenTerminal?: () => void;
@@ -70,10 +78,11 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
     }))
   );
 
-  const { openSession, openSessionInSplit, tabs } = useSessionStore(
+  const { openSession, openSessionInSplit, openRdpSession, tabs } = useSessionStore(
     useShallow((s) => ({
       openSession: s.openSession,
       openSessionInSplit: s.openSessionInSplit,
+      openRdpSession: s.openRdpSession,
       tabs: s.tabs,
     }))
   );
@@ -109,6 +118,7 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
   } | null>(null);
 
   const [copyToast, setCopyToast] = useState<string | null>(null);
+  const [rdpCredsHost, setRdpCredsHost] = useState<Host | null>(null);
 
   const showCopyToast = useCallback((msg: string) => {
     setCopyToast(msg);
@@ -274,6 +284,33 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
     [onOpenTerminal, openSessionInSplit]
   );
 
+  const handleRdpConnect = useCallback(
+    async (host: Host) => {
+      if (!useVaultStore.getState().isUnlocked) {
+        useVaultStore.getState().openUnlockPrompt();
+        return;
+      }
+      // Hosts with a stored password connect straight away (the backend
+      // decrypts it from the vault); otherwise prompt for RDP credentials.
+      if (host.auth_method === "password") {
+        onOpenTerminal?.();
+        await openRdpSession(host);
+      } else {
+        setRdpCredsHost(host);
+      }
+    },
+    [onOpenTerminal, openRdpSession]
+  );
+
+  const handleRdpCredsSubmit = useCallback(
+    async (host: Host, creds: RdpCredentials) => {
+      setRdpCredsHost(null);
+      onOpenTerminal?.();
+      await openRdpSession(host, creds);
+    },
+    [onOpenTerminal, openRdpSession]
+  );
+
   const handleSftpClick = useCallback(
     async (e: React.MouseEvent, host: Host) => {
       e.stopPropagation();
@@ -332,6 +369,11 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
     >
       {/* Folder create/rename modal */}
       <FolderModal />
+      <RdpCredentialsModal
+        host={rdpCredsHost}
+        onClose={() => setRdpCredsHost(null)}
+        onSubmit={handleRdpCredsSubmit}
+      />
 
       {/* Top Search & Actions Bar */}
       <div className="mb-6 flex flex-col gap-2.5 min-w-0">
@@ -545,6 +587,7 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
                   onConnect={handleConnect}
                   onToggleMenu={handleToggleMenu}
                   onSftp={handleSftpClick}
+                  onRdp={handleRdpConnect}
                   onTunnels={onOpenTunnels}
                   onEdit={openEditModal}
                   onDuplicate={openDuplicateModal}
@@ -576,6 +619,7 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
                   onConnect={handleConnect}
                   onToggleMenu={handleToggleMenu}
                   onSftp={handleSftpClick}
+                  onRdp={handleRdpConnect}
                   onTunnels={onOpenTunnels}
                   onEdit={openEditModal}
                   onDuplicate={openDuplicateModal}
@@ -596,9 +640,6 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                   Groups
                 </h2>
-                <span className="text-[11px] font-mono text-[var(--text-muted)]">
-                  Click group to view hosts
-                </span>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
@@ -623,9 +664,6 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
               <h2 className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                 Hosts
               </h2>
-              <span className="text-[11px] font-mono text-[var(--text-muted)]">
-                Ordered by last opened
-              </span>
             </div>
 
             {sortedRecentHosts.length === 0 ? (
@@ -659,6 +697,7 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
                     onConnect={handleConnect}
                     onToggleMenu={handleToggleMenu}
                     onSftp={handleSftpClick}
+                    onRdp={handleRdpConnect}
                     onTunnels={onOpenTunnels}
                     onEdit={openEditModal}
                     onDuplicate={openDuplicateModal}
@@ -690,6 +729,7 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
                     onConnect={handleConnect}
                     onToggleMenu={handleToggleMenu}
                     onSftp={handleSftpClick}
+                    onRdp={handleRdpConnect}
                     onTunnels={onOpenTunnels}
                     onEdit={openEditModal}
                     onDuplicate={openDuplicateModal}
@@ -762,6 +802,20 @@ export function HostList({ onOpenTerminal, onOpenSftp, onOpenTunnels }: HostList
                 <FolderOpen size={13} />
                 <span>SFTP Files</span>
               </button>
+
+              {/* RDP (Windows only) */}
+              {IS_WINDOWS && (
+                <button
+                  onClick={() => {
+                    handleRdpConnect(contextMenu.host!);
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 hover:bg-[var(--surface-container)] hover:text-[var(--text-primary)] transition-colors group"
+                >
+                  <Monitor size={13} />
+                  <span>Connetti RDP</span>
+                </button>
+              )}
 
               {/* Port Forwarding */}
               <button
@@ -1015,6 +1069,7 @@ interface HostCardProps {
   onConnect: (host: Host) => void;
   onToggleMenu: (hostId: string) => void;
   onSftp: (e: React.MouseEvent, host: Host) => void;
+  onRdp?: (host: Host) => void;
   onTunnels: () => void;
   onEdit: (host: Host) => void;
   onDuplicate: (host: Host) => void;
@@ -1031,6 +1086,7 @@ const HostCard = memo(function HostCard({
   onConnect,
   onToggleMenu,
   onSftp,
+  onRdp,
   onTunnels,
   onEdit,
   onDuplicate,
@@ -1135,6 +1191,19 @@ const HostCard = memo(function HostCard({
               <FolderOpen size={13} />
               <span>SFTP Files</span>
             </button>
+
+            {IS_WINDOWS && onRdp && (
+              <button
+                onClick={() => {
+                  onToggleMenu(host.id);
+                  onRdp(host);
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-[var(--text-primary)] hover:bg-[var(--surface-high)] transition"
+              >
+                <Monitor size={13} />
+                <span>Connetti RDP</span>
+              </button>
+            )}
 
             <button
               onClick={() => {
